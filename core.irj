@@ -2,8 +2,116 @@ mod butterfly.core
 
 ;; Butterfly — reactive signal graph for Irij.
 ;; Spindel-inspired: signals, computes, watchers over one effect-managed graph.
-;; Subscribers are stored lambdas invoked as plain calls (one-shot-resume safe).
+;;
+;; Architecture rules (docs/plan; enforced by convention in every PR):
+;;   - Handler clauses are pure state transitions + a single `resume`.
+;;   - Watcher/compute lambdas are invoked caller-side by the pub fn
+;;     wrappers, never inside handler clauses (one-shot resume safety,
+;;     tier-a clauses, checkable effect rows).
+;;   - The rx-* effect ops are internal surface: always go through the
+;;     wrapper fns (signal/deref/peek/swap/reset/...) unless you are
+;;     butterfly itself.
+;;
+;; v0.1 discipline: one global graph (handler state is a singleton),
+;; single-threaded mutation.
 
 pub fn butterfly-version :: Str
   =>
   "0.1"
+
+;; ── Handles ─────────────────────────────────────────
+
+;; Opaque signal handle. `id` indexes into the graph.
+pub spec Sig
+  id :: Int
+
+;; ── Effect (internal surface) ───────────────────────
+
+pub effect Reactive
+  rx-new     :: _ Int
+  rx-read    :: Int _
+  rx-peek    :: Int _
+  rx-poke    :: Int _ Map
+  rx-version :: Int Int
+  rx-reset   :: ()
+
+;; ── Graph state ─────────────────────────────────────
+
+;; next-id: fresh Sig ids
+;; vals:    id → current value
+;; vers:    id → write counter (listen polls this; PR5)
+fn fresh-graph :: Map
+  =>
+  {next-id= 0 vals= {} vers= {}}
+
+pub handler reactive :: Reactive
+  state :! fresh-graph ()
+  rx-new init =>
+    id := get "next-id" state
+    vals2 := assoc (get "vals" state) id init
+    vers2 := assoc (get "vers" state) id 0
+    state <- merge state {next-id= (id + 1) vals= vals2 vers= vers2}
+    resume id
+  rx-read id =>
+    resume (get id (get "vals" state))
+  rx-peek id =>
+    resume (get id (get "vals" state))
+  rx-poke id v =>
+    old := get id (get "vals" state)
+    vals2 := assoc (get "vals" state) id v
+    vers2 := assoc (get "vers" state) id ((get id (get "vers" state)) + 1)
+    state <- merge state {vals= vals2 vers= vers2}
+    resume {old= old new= v watchers= #[]}
+  rx-version id =>
+    resume (get id (get "vers" state))
+  rx-reset () =>
+    state <- fresh-graph ()
+    resume ()
+
+;; ── Public API ──────────────────────────────────────
+
+;; Create a signal holding an initial value.
+pub fn signal :: _ Sig ::: Reactive
+  => v
+  id := rx-new v
+  Sig id
+
+;; Read a signal's current value. (From PR3 on, deref inside a compute
+;; also records the dependency; peek never will.)
+pub fn deref :: Sig _ ::: Reactive
+  => s
+  rx-read s.id
+
+;; Read without dependency tracking.
+pub fn peek :: Sig _ ::: Reactive
+  => s
+  rx-peek s.id
+
+;; Invoke watcher callbacks from a poke bundle. No watchers yet (PR2).
+fn dispatch-bundle :: Map ()
+  => bundle
+  ()
+
+;; Set a signal to a new value. Returns the new value.
+pub fn reset :: Sig _ _ ::: Reactive
+  => s v
+  bundle := rx-poke s.id v
+  dispatch-bundle bundle
+  v
+
+;; Update a signal by applying f to its current value. Returns the new value.
+pub fn swap :: Sig (Fn):eff _ ::: Reactive eff
+  => s f
+  old := rx-peek s.id
+  reset s (f old)
+
+;; Number of writes a signal has seen (0 for a fresh signal).
+pub fn sig-version :: Sig Int ::: Reactive
+  => s
+  rx-version s.id
+
+;; Drop the whole graph. Test isolation: handler state is a global
+;; singleton, so every test case starts with reset-graph.
+pub fn reset-graph :: () ::: Reactive
+  =>
+  rx-reset ()

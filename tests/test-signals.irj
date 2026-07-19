@@ -1,0 +1,99 @@
+use std.test :open
+use butterfly.core :open
+
+;; Handler state is a global singleton — every case opens with
+;; reset-graph so cases don't bleed into each other.
+
+fn run-create-deref ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 5
+    assert-eq 5 (deref s)
+
+fn run-swap ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 10
+    r := swap s (x -> x + 1)
+    assert-eq 11 r
+    assert-eq 11 (deref s)
+
+fn run-reset ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 1
+    r := reset s 99
+    assert-eq 99 r
+    assert-eq 99 (deref s)
+
+fn run-peek ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 3
+    assert-eq 3 (peek s)
+    assert-eq (deref s) (peek s)
+
+fn run-independence ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    b := signal 2
+    swap a (x -> x + 10)
+    assert-eq 11 (deref a)
+    assert-eq 2 (deref b)
+
+fn run-version-bumps ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    assert-eq 0 (sig-version s)
+    reset s 1
+    reset s 2
+    assert-eq 2 (sig-version s)
+    swap s (x -> x + 1)
+    assert-eq 3 (sig-version s)
+
+fn run-graph-reset ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    b := signal 2
+    reset-graph ()
+    c := signal 42
+    assert-eq 0 c.id
+    assert-eq 42 (deref c)
+
+fn run-string-values ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal "hello"
+    swap s (t -> t ++ " world")
+    assert-eq "hello world" (deref s)
+
+fn run-spec-rejects ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    assert-throws (-> deref 5)
+
+results := #[
+  (test "signal + deref returns initial value"   run-create-deref)
+  (test "swap applies fn and returns new value"  run-swap)
+  (test "reset stores and returns new value"     run-reset)
+  (test "peek reads same value as deref"         run-peek)
+  (test "two signals are independent"            run-independence)
+  (test "version bumps on every write"           run-version-bumps)
+  (test "reset-graph clears the graph"           run-graph-reset)
+  (test "non-Int signal values work"             run-string-values)
+  (test "deref rejects non-Sig arg (spec)"       run-spec-rejects)
+]
+
+summarize results
