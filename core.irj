@@ -3,17 +3,19 @@ mod butterfly.core
 ;; Butterfly — reactive signal graph for Irij.
 ;; Spindel-inspired: signals, computes, watchers over one effect-managed graph.
 ;;
-;; Architecture rules (docs/plan; enforced by convention in every PR):
+;; Architecture rules (enforced by convention in every PR):
 ;;   - Handler clauses are pure state transitions + a single `resume`.
 ;;   - Watcher/compute lambdas are invoked caller-side by the pub fn
 ;;     wrappers, never inside handler clauses (one-shot resume safety,
 ;;     tier-a clauses, checkable effect rows).
 ;;   - The rx-* effect ops are internal surface: always go through the
-;;     wrapper fns (signal/deref/peek/swap/reset/...) unless you are
-;;     butterfly itself.
+;;     wrapper fns (signal/deref/peek/swap/reset/watch/...) unless you
+;;     are butterfly itself.
 ;;
 ;; v0.1 discipline: one global graph (handler state is a singleton),
-;; single-threaded mutation.
+;; single-threaded mutation. Watcher effects are checked dynamically at
+;; the write site: a watcher performing e.g. Console needs Console
+;; available wherever the triggering reset/swap runs.
 
 pub fn butterfly-version :: Str
   =>
@@ -25,6 +27,11 @@ pub fn butterfly-version :: Str
 pub spec Sig
   id :: Int
 
+;; Watcher registration handle; feed it to `unwatch`.
+pub spec Watch
+  sig :: Int
+  wid :: Int
+
 ;; ── Effect (internal surface) ───────────────────────
 
 pub effect Reactive
@@ -33,16 +40,26 @@ pub effect Reactive
   rx-peek    :: Int _
   rx-poke    :: Int _ Map
   rx-version :: Int Int
+  rx-watch   :: Int Fn Int
+  rx-unwatch :: Int Int ()
   rx-reset   :: ()
 
 ;; ── Graph state ─────────────────────────────────────
 
-;; next-id: fresh Sig ids
-;; vals:    id → current value
-;; vers:    id → write counter (listen polls this; PR5)
+;; next-id:  fresh Sig ids
+;; vals:     id → current value
+;; vers:     id → write counter (listen polls this; PR5)
+;; watchers: wid → {sig= cb=} — flat registry, filtered per write
+;; next-wid: fresh watcher ids
 fn fresh-graph :: Map
   =>
-  {next-id= 0 vals= {} vers= {}}
+  {next-id= 0 vals= {} vers= {} watchers= {} next-wid= 0}
+
+;; Callbacks watching `id`, in registration (wid) order. Pure.
+fn watcher-fns-for :: Map Int Vec
+  => ws id
+  wids := sort (/? (w -> get "sig" (get w ws) == id) (keys ws))
+  @ (w -> get "cb" (get w ws)) wids
 
 pub handler reactive :: Reactive
   state :! fresh-graph ()
@@ -61,12 +78,35 @@ pub handler reactive :: Reactive
     vals2 := assoc (get "vals" state) id v
     vers2 := assoc (get "vers" state) id ((get id (get "vers" state)) + 1)
     state <- merge state {vals= vals2 vers= vers2}
-    resume {old= old new= v watchers= #[]}
+    resume {old= old new= v watchers= (watcher-fns-for (get "watchers" state) id)}
   rx-version id =>
     resume (get id (get "vers" state))
+  rx-watch id f =>
+    wid := get "next-wid" state
+    ws2 := assoc (get "watchers" state) wid {sig= id cb= f}
+    state <- merge state {next-wid= (wid + 1) watchers= ws2}
+    resume wid
+  rx-unwatch id wid =>
+    state <- merge state {watchers= (dissoc (get "watchers" state) wid)}
+    resume ()
   rx-reset () =>
     state <- fresh-graph ()
     resume ()
+
+;; ── Dispatch (caller-side lambda invocation) ────────
+
+;; The `::: eff` free row variable makes these effect-transparent
+;; (ambient frame): stored watcher lambdas run against the write
+;; site's effect row, which is exactly the contract we document.
+fn run-watchers :: Vec _ _ () ::: eff
+  => fns old new-v
+  @ (f -> f old new-v) fns
+  ()
+
+;; Invoke watcher callbacks from a poke bundle: each gets (old new).
+fn dispatch-bundle :: Map () ::: eff
+  => bundle
+  run-watchers (get "watchers" bundle) (get "old" bundle) (get "new" bundle)
 
 ;; ── Public API ──────────────────────────────────────
 
@@ -87,23 +127,32 @@ pub fn peek :: Sig _ ::: Reactive
   => s
   rx-peek s.id
 
-;; Invoke watcher callbacks from a poke bundle. No watchers yet (PR2).
-fn dispatch-bundle :: Map ()
-  => bundle
-  ()
-
-;; Set a signal to a new value. Returns the new value.
-pub fn reset :: Sig _ _ ::: Reactive
+;; Set a signal to a new value; watchers fire synchronously,
+;; in registration order. Returns the new value.
+pub fn reset :: Sig _ _ ::: Reactive eff
   => s v
   bundle := rx-poke s.id v
   dispatch-bundle bundle
   v
 
-;; Update a signal by applying f to its current value. Returns the new value.
+;; Update a signal by applying f to its current value; watchers fire.
+;; Returns the new value.
 pub fn swap :: Sig (Fn):eff _ ::: Reactive eff
   => s f
   old := rx-peek s.id
   reset s (f old)
+
+;; Run f (old new) on every write to s. Returns a Watch handle.
+;; Don't write the watched signal from its own watcher (sync cycle).
+pub fn watch :: Sig (Fn):eff Watch ::: Reactive eff
+  => s f
+  wid := rx-watch s.id f
+  Watch s.id wid
+
+;; Remove a watcher.
+pub fn unwatch :: Watch () ::: Reactive
+  => w
+  rx-unwatch w.sig w.wid
 
 ;; Number of writes a signal has seen (0 for a fresh signal).
 pub fn sig-version :: Sig Int ::: Reactive

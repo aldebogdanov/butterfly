@@ -1,0 +1,104 @@
+use std.test :open
+use butterfly.core :open
+
+fn run-old-new ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 10
+    seen := signal #()
+    watch src (o n -> reset seen #(o n))
+    reset src 20
+    assert-eq #(10 20) (deref seen)
+
+fn run-registration-order ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    log := signal #[]
+    watch src (o n -> swap log (xs -> conj xs n))
+    watch src (o n -> swap log (xs -> conj xs 99))
+    reset src 5
+    assert-eq #[5 99] (deref log)
+
+fn run-swap-fires ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 7
+    seen := signal 0
+    watch src (o n -> reset seen n)
+    swap src (x -> x * 2)
+    assert-eq 14 (deref seen)
+
+fn run-unwatch ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    log := signal #[]
+    w1 := watch src (o n -> swap log (xs -> conj xs n))
+    w2 := watch src (o n -> swap log (xs -> conj xs 99))
+    unwatch w2
+    reset src 6
+    assert-eq #[6] (deref log)
+
+fn run-signal-scoped ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 0
+    b := signal 0
+    log := signal #[]
+    watch a (o n -> swap log (xs -> conj xs n))
+    reset b 3
+    assert-eq #[] (deref log)
+    reset a 1
+    assert-eq #[1] (deref log)
+
+fn run-cascade ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    b := signal 0
+    c := signal 0
+    watch a (o n -> reset b (n * 10))
+    watch b (o n -> reset c (n + 1))
+    reset a 5
+    assert-eq 50 (deref b)
+    assert-eq 51 (deref c)
+
+fn run-console-watcher ::: Reactive Console
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    watch src (o n -> println ("watched: " ++ to-str n))
+    reset src 8
+    assert-eq 8 (deref src)
+
+fn run-unwatch-idempotent ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    w := watch src (o n -> n)
+    unwatch w
+    unwatch w
+    reset src 1
+    assert-eq 1 (deref src)
+
+results := #[
+  (test "watcher receives old and new values"        run-old-new)
+  (test "watchers fire in registration order"        run-registration-order)
+  (test "swap fires watchers too"                    run-swap-fires)
+  (test "unwatch stops delivery"                     run-unwatch)
+  (test "watchers are scoped to their signal"        run-signal-scoped)
+  (test "watcher cascade propagates writes"          run-cascade)
+  (test "console-effect watcher runs at write site"  run-console-watcher)
+  (test "double unwatch is harmless"                 run-unwatch-idempotent)
+]
+
+summarize results
