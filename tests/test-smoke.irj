@@ -1,0 +1,6 @@
+use std.test :open
+use butterfly.core :open
+
+r1 := test "butterfly loads and reports version" (-> assert-eq "0.1" (butterfly-version ()))
+
+summarize #[r1]

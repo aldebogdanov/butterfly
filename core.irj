@@ -1,0 +1,9 @@
+mod butterfly.core
+
+;; Butterfly — reactive signal graph for Irij.
+;; Spindel-inspired: signals, computes, watchers over one effect-managed graph.
+;; Subscribers are stored lambdas invoked as plain calls (one-shot-resume safe).
+
+pub fn butterfly-version :: Str
+  =>
+  "0.1"

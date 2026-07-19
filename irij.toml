@@ -1,0 +1,6 @@
+[project]
+name = "butterfly"
+version = "0.1"
+description = "Irij reactivity library"
+author = "aldebogdanov"
+license = "MIT"
