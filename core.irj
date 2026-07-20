@@ -26,8 +26,9 @@ use std.convert {to-int}
 ;;
 ;; v0.1 discipline: one global graph (handler state is a singleton),
 ;; single-threaded mutation. Effects in watcher callbacks and compute
-;; thunks are checked at the site that triggers them (write / deref).
-;; Don't write signals from inside compute thunks.
+;; thunks are checked where the lambdas are registered (watch/compute
+;; bind `:eff` there); the later dispatch runs them under an ambient
+;; frame. Don't write signals from inside compute thunks.
 
 pub fn butterfly-version :: Str
   =>
@@ -329,16 +330,20 @@ pub handler reactive :: Reactive
 
 ;; ── Dispatch + forcing (caller-side lambda invocation) ──
 
-;; Free `::: eff` row = effect-transparent: stored lambdas run against
-;; the row of the site that triggers them (write / deref).
-fn run-watchers :: Vec _ _ () ::: eff
+;; Row vars must be bound (irij Phase 6), so effect transparency
+;; lives exactly where the lambdas enter: run-watchers binds eff
+;; through its callback vector, recompute through its thunk. Fns
+;; higher up the chain (reset/deref/dispatch) carry plain
+;; ::: Reactive; at their call sites the binding is vacuous, and the
+;; stored lambdas run under this fn's ambient frame at runtime.
+fn run-watchers :: #[(Fn):eff] _ _ () ::: eff
   => fns old new-v
   @ (f -> f old new-v) fns
   ()
 
 ;; Run a compute thunk under a fresh tracking frame; store result.
 ;; On thunk error: pop the frame, rethrow.
-fn recompute :: Int Fn _ ::: Reactive eff
+fn recompute :: Int (Fn):eff _ ::: Reactive eff
   => id thunk
   rx-begin-track id
   r := try (-> thunk ())
@@ -358,14 +363,14 @@ fn drop-value :: _ ()
   => v
   ()
 
-fn freshen-compute :: Int Map () ::: Reactive eff
+fn freshen-compute :: Int Map () ::: Reactive
   => id m
   if (get "dirty" m)
     drop-value (recompute id (get "thunk" m))
   else
     ()
 
-fn ensure-fresh :: Int Map () ::: Reactive eff
+fn ensure-fresh :: Int Map () ::: Reactive
   => id m
   if (get "compute" m)
     freshen-compute id m
@@ -374,13 +379,13 @@ fn ensure-fresh :: Int Map () ::: Reactive eff
 
 ;; Read any id: recompute first if it's a dirty compute, then rx-read
 ;; (which also records the dep edge for an enclosing thunk).
-fn force-id :: Int _ ::: Reactive eff
+fn force-id :: Int _ ::: Reactive
   => id
   m := rx-meta id
   ensure-fresh id m
   rx-read id
 
-fn run-one-dirty :: Map () ::: Reactive eff
+fn run-one-dirty :: Map () ::: Reactive
   => e
   new-v := force-id (get "cid" e)
   run-watchers (get "cbs" e) (get "old" e) new-v
@@ -388,7 +393,7 @@ fn run-one-dirty :: Map () ::: Reactive eff
 ;; Invoke watcher callbacks from a bundle: per-signal entries first
 ;; (id order for batches), then watched dirty computes (eagerly
 ;; re-forced so watchers see the fresh value).
-fn dispatch-bundle :: Map () ::: Reactive eff
+fn dispatch-bundle :: Map () ::: Reactive
   => bundle
   @ (e -> run-watchers (get "cbs" e) (get "old" e) (get "new" e)) (get "entries" bundle)
   @ (e -> run-one-dirty e) (get "dirty-watched" bundle)
@@ -419,7 +424,7 @@ pub fn compute :: (Fn):eff Sig ::: Reactive eff
 
 ;; Read a signal or compute. Dirty computes recompute first. Inside a
 ;; running compute thunk this records the dependency edge.
-pub fn deref :: Sig _ ::: Reactive eff
+pub fn deref :: Sig _ ::: Reactive
   => s
   force-id s.id
 
@@ -431,7 +436,7 @@ pub fn peek :: Sig _ ::: Reactive
 
 ;; Set a signal (writes to computes are rejected); watchers fire
 ;; synchronously in registration order. Returns the new value.
-pub fn reset :: Sig _ _ ::: Reactive eff
+pub fn reset :: Sig _ _ ::: Reactive
   => s v
   bundle := rx-poke s.id v
   dispatch-bundle bundle

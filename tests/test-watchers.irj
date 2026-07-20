@@ -82,14 +82,14 @@ fn run-console-watcher ::: Reactive Console
 ;; Locals are captured by value, so each registered lambda keeps its
 ;; own i. 12 watchers crosses the wid=10 boundary — guards against
 ;; lexicographic ordering of stringified registry keys.
-fn add-watchers-upto ::: Reactive eff
+fn add-watchers-upto ::: Reactive
   => src log i limit
   if (i == limit)
     ()
   else
     add-watchers-step src log i limit
 
-fn add-watchers-step ::: Reactive eff
+fn add-watchers-step ::: Reactive
   => src log i limit
   watch src (o n -> swap log (xs -> conj xs i))
   add-watchers-upto src log (i + 1) limit

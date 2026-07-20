@@ -3,7 +3,7 @@ use butterfly.core :open
 
 ;; Branch helper: lambda bodies are single expressions, so branching
 ;; thunk logic lives in top-level fns.
-fn choose ::: Reactive eff
+fn choose ::: Reactive
   => flag x y
   if (deref flag)
     deref x
