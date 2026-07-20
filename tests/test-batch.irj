@@ -1,0 +1,131 @@
+use std.test :open
+use butterfly.core :open
+
+fn write-three ::: Reactive eff
+  => s
+  swap s (x -> x + 1)
+  swap s (x -> x + 1)
+  swap s (x -> x + 1)
+
+fn run-collapse ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    log := signal #[]
+    watch s (o n -> swap log (xs -> conj xs #(o n)))
+    batch (-> write-three s)
+    assert-eq #[#(0 3)] (deref log)
+    assert-eq 3 (deref s)
+
+fn write-two-signals ::: Reactive eff
+  => a b
+  reset a 1
+  reset b 2
+  reset a 10
+
+fn run-multi-signal ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 0
+    b := signal 0
+    log := signal #[]
+    watch a (o n -> swap log (xs -> conj xs #("a" o n)))
+    watch b (o n -> swap log (xs -> conj xs #("b" o n)))
+    batch (-> write-two-signals a b)
+    assert-eq #[#("a" 0 10) #("b" 0 2)] (deref log)
+
+fn inner-writes ::: Reactive eff
+  => s
+  batch (-> write-three s)
+  swap s (x -> x + 100)
+
+fn run-nested ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    hits := signal 0
+    watch s (o n -> swap hits (x -> x + 1))
+    batch (-> inner-writes s)
+    assert-eq 1 (deref hits)
+    assert-eq 103 (deref s)
+
+fn run-returns-value ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 5
+    r := batch (-> swap s (x -> x * 2))
+    assert-eq 10 r
+
+fn run-read-your-writes ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    c := compute (-> (deref a) * 10)
+    probe := signal 0
+    batch (-> observe-mid-batch a c probe)
+    assert-eq 70 (deref probe)
+
+fn observe-mid-batch ::: Reactive eff
+  => a c probe
+  reset a 7
+  reset probe (deref c)
+
+fn run-watched-compute-once ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    c := compute (-> (deref a) + 100)
+    deref c
+    clog := signal #[]
+    watch c (o n -> swap clog (xs -> conj xs #(o n)))
+    batch (-> write-three a)
+    assert-eq #[#(101 104)] (deref clog)
+
+fn run-empty-batch ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    hits := signal 0
+    watch s (o n -> swap hits (x -> x + 1))
+    batch (-> ())
+    assert-eq 0 (deref hits)
+
+fn failing-writes ::: Reactive eff
+  => s
+  reset s 1
+  error "boom inside batch"
+
+fn attempt-failing-batch ::: Reactive
+  => s
+  batch (-> failing-writes s)
+
+fn run-error-still-flushes ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    log := signal #[]
+    watch s (o n -> swap log (xs -> conj xs n))
+    assert-throws (-> attempt-failing-batch s)
+    assert-eq #[1] (deref log)
+    assert-eq 1 (deref s)
+
+results := #[
+  (test "batch collapses N writes into one notification"      run-collapse)
+  (test "batch notifies each changed signal once, id order"   run-multi-signal)
+  (test "nested batches flush only at the outermost exit"     run-nested)
+  (test "batch returns the thunk's value"                     run-returns-value)
+  (test "reads inside a batch see fresh values"               run-read-your-writes)
+  (test "watched compute fires once with pre-batch old"       run-watched-compute-once)
+  (test "empty batch notifies nothing"                        run-empty-batch)
+  (test "error in batch: prior writes flush, error rethrows"  run-error-still-flushes)
+]
+
+summarize results
