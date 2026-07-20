@@ -1,0 +1,106 @@
+use std.test :open
+use butterfly.core :open
+use butterfly.combinators :open
+
+fn run-map-signal ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 3
+    dbl := map-signal (x -> x * 2) src
+    assert-eq 6 (deref dbl)
+    reset src 10
+    assert-eq 20 (deref dbl)
+
+fn run-map-signal-caches ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 1
+    dbl := map-signal (x -> x * 2) src
+    deref dbl
+    v1 := sig-version dbl
+    deref dbl
+    assert-eq v1 (sig-version dbl)
+
+fn run-merge ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 0
+    b := signal 0
+    m := merge-signals #[a b]
+    reset a 1
+    assert-eq 1 (deref m)
+    reset b 2
+    assert-eq 2 (deref m)
+    reset a 3
+    assert-eq 3 (deref m)
+
+fn burst-then-wait ::: Reactive Time
+  => src
+  reset src 1
+  reset src 2
+  reset src 3
+  sleep 200
+
+fn run-debounce ::: Reactive Time
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    dst := debounce 60 src
+    hits := signal 0
+    watch dst (o n -> swap hits (x -> x + 1))
+    burst-then-wait src
+    assert-eq 3 (deref dst)
+    assert-eq 1 (deref hits)
+
+fn quiet-gap-writes ::: Reactive Time
+  => src
+  reset src 1
+  sleep 150
+  reset src 2
+  sleep 150
+
+fn run-debounce-two-windows ::: Reactive Time
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    dst := debounce 60 src
+    hits := signal 0
+    watch dst (o n -> swap hits (x -> x + 1))
+    quiet-gap-writes src
+    assert-eq 2 (deref dst)
+    assert-eq 2 (deref hits)
+
+fn throttle-writes ::: Reactive Time
+  => src
+  reset src 1
+  reset src 2
+  sleep 150
+  reset src 3
+
+fn run-throttle ::: Reactive Time
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    dst := throttle 80 src
+    log := signal #[]
+    watch dst (o n -> swap log (xs -> conj xs n))
+    throttle-writes src
+    assert-eq #[1 3] (deref log)
+    assert-eq 3 (deref dst)
+
+results := #[
+  (test "map-signal derives and follows the source"      run-map-signal)
+  (test "map-signal is a cached compute"                 run-map-signal-caches)
+  (test "merge-signals follows the latest of any source" run-merge)
+  (test "debounce collapses a burst into one emission"   run-debounce)
+  (test "debounce fires once per quiet window"           run-debounce-two-windows)
+  (test "throttle passes leading edge, drops the rest"   run-throttle)
+]
+
+summarize results

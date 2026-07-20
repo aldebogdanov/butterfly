@@ -1,0 +1,85 @@
+mod butterfly.combinators
+
+use butterfly.core :open
+
+;; Butterfly combinators — derived-signal constructors built entirely
+;; on the public core API (signal/compute/watch/peek/reset/swap).
+;;
+;; Naming: `merge-signals` not `merge` — `merge` is the map builtin.
+;; Timing combinators (debounce/throttle) fire their arms from
+;; watchers at write time; debounce defers via spawned fibers, so its
+;; output lands cross-fiber — same discipline as `listen` consumers.
+
+fn ignore :: _ ()
+  => v
+  ()
+
+;; Derived signal: dst = f(src), auto-updating. Sugar over compute.
+pub fn map-signal :: (Fn):eff Sig Sig ::: Reactive eff
+  => f src
+  compute (-> f (deref src))
+
+;; One output signal following the latest write of any source.
+pub fn merge-signals :: #[Sig] Sig ::: Reactive
+  => sigs
+  dst := signal ()
+  attach-merge sigs dst
+  dst
+
+fn attach-merge :: #[Sig] Sig () ::: Reactive
+  => sigs dst
+  @ (s -> watch s (o n -> reset dst n)) sigs
+  ()
+
+;; ── debounce ────────────────────────────────────────
+
+;; dst follows src, but only after ms of write silence. Each write
+;; bumps a generation; a spawned fiber fires iff its generation is
+;; still current after the quiet window.
+pub fn debounce :: Int Sig Sig ::: Reactive Time
+  => ms src
+  dst := signal (peek src)
+  gen := signal 0
+  watch src (o n -> debounce-arm ms src dst gen)
+  dst
+
+fn debounce-arm :: Int Sig Sig Sig () ::: Reactive Time
+  => ms src dst gen
+  my := swap gen (x -> x + 1)
+  spawn (-> debounce-fire ms src dst gen my)
+  ()
+
+fn debounce-fire :: Int Sig Sig Sig Int () ::: Reactive Time
+  => ms src dst gen my
+  sleep ms
+  cur := peek gen
+  if (cur == my)
+    ignore (reset dst (peek src))
+  else
+    ()
+
+;; ── throttle ────────────────────────────────────────
+
+;; Leading-edge rate limit: a write passes through iff at least ms
+;; elapsed since the last passed write; others are dropped.
+pub fn throttle :: Int Sig Sig ::: Reactive Time
+  => ms src
+  dst := signal (peek src)
+  last := signal 0
+  watch src (o n -> throttle-arm ms dst last n)
+  dst
+
+fn throttle-arm :: Int Sig Sig _ () ::: Reactive Time
+  => ms dst last n
+  now := now-ms ()
+  prev := peek last
+  if ((now - prev) >= ms)
+    throttle-pass dst last now n
+  else
+    ()
+
+fn throttle-pass :: Sig Sig Int _ () ::: Reactive
+  => dst last now n
+  reset last now
+  reset dst n
+  ()

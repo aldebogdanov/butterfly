@@ -15,7 +15,7 @@ individually reviewed pull requests. The API below lands incrementally.
 | Derived values | `compute` (auto-tracked, cached, glitch-free) |
 | Batching | `batch` |
 | Blocking reads | `listen` · `listen-or` |
-| Combinators | `map-signal` · `merge` · `debounce` · `throttle` |
+| Combinators | `map-signal` · `merge-signals` · `debounce` · `throttle` |
 | Time travel | `snapshot` · `restore` |
 
 ## Design
