@@ -1,5 +1,8 @@
 mod butterfly.core
 
+use std.list {fold}
+use std.collection {distinct}
+
 ;; Butterfly — reactive signal graph for Irij.
 ;; Spindel-inspired: signals, computes, watchers over one effect-managed graph.
 ;;
@@ -9,13 +12,21 @@ mod butterfly.core
 ;;     wrappers, never inside handler clauses (one-shot resume safety,
 ;;     tier-a clauses, checkable effect rows).
 ;;   - The rx-* effect ops are internal surface: always go through the
-;;     wrapper fns (signal/deref/peek/swap/reset/watch/...) unless you
-;;     are butterfly itself.
+;;     wrapper fns (signal/deref/peek/swap/reset/watch/compute/...)
+;;     unless you are butterfly itself.
+;;
+;; Computes: stored thunks, lazily re-run on deref when dirty (pull),
+;; except watched computes which are re-forced eagerly at write time so
+;; their watchers fire. Dependency edges are recorded automatically by
+;; deref during a thunk run (tracking stack) and re-targeted after every
+;; run, so branch switches drop stale edges. A write marks dependents
+;; dirty transitively (BFS, visited-set) — in a diamond a→(b c)→d, d
+;; recomputes exactly once per wave.
 ;;
 ;; v0.1 discipline: one global graph (handler state is a singleton),
-;; single-threaded mutation. Watcher effects are checked dynamically at
-;; the write site: a watcher performing e.g. Console needs Console
-;; available wherever the triggering reset/swap runs.
+;; single-threaded mutation. Effects in watcher callbacks and compute
+;; thunks are checked at the site that triggers them (write / deref).
+;; Don't write signals from inside compute thunks.
 
 pub fn butterfly-version :: Str
   =>
@@ -23,7 +34,7 @@ pub fn butterfly-version :: Str
 
 ;; ── Handles ─────────────────────────────────────────
 
-;; Opaque signal handle. `id` indexes into the graph.
+;; Opaque handle to a signal OR a compute. `id` indexes into the graph.
 pub spec Sig
   id :: Int
 
@@ -35,31 +46,115 @@ pub spec Watch
 ;; ── Effect (internal surface) ───────────────────────
 
 pub effect Reactive
-  rx-new     :: _ Int
-  rx-read    :: Int _
-  rx-peek    :: Int _
-  rx-poke    :: Int _ Map
-  rx-version :: Int Int
-  rx-watch   :: Int Fn Int
-  rx-unwatch :: Int Int ()
-  rx-reset   :: ()
+  rx-new         :: _ Int
+  rx-read        :: Int _
+  rx-peek        :: Int _
+  rx-poke        :: Int _ Map
+  rx-version     :: Int Int
+  rx-watch       :: Int Fn Int
+  rx-unwatch     :: Int Int ()
+  rx-new-compute :: Fn Int
+  rx-meta        :: Int Map
+  rx-begin-track :: Int ()
+  rx-store       :: Int _ ()
+  rx-abort-track :: ()
+  rx-reset       :: ()
 
 ;; ── Graph state ─────────────────────────────────────
 
-;; next-id:  fresh Sig ids
-;; vals:     id → current value
-;; vers:     id → write counter (listen polls this; PR5)
-;; watchers: wid → {sig= cb=} — flat registry, filtered per write
-;; next-wid: fresh watcher ids
+;; next-id:    fresh Sig ids (signals and computes share the id space)
+;; vals:       signal id → current value
+;; vers:       id → write counter (for signals) / recompute counter
+;;             (for computes); listen polls this (PR5)
+;; watchers:   wid → {sig= cb=} — flat registry, filtered per write
+;; next-wid:   fresh watcher ids
+;; computes:   id → {thunk= dirty= cached= deps=}
+;; dependents: id → Vec of compute ids that read it (reverse edges)
+;; tracking:   stack of {cid= deps=} frames, one per running thunk
 fn fresh-graph :: Map
   =>
-  {next-id= 0 vals= {} vers= {} watchers= {} next-wid= 0}
+  {next-id= 0 vals= {} vers= {} watchers= {} next-wid= 0 computes= {} dependents= {} tracking= #[]}
 
-;; Callbacks watching `id`, in registration (wid) order. Pure.
+;; ── Pure graph helpers (called from clauses — must stay pure) ──
+
+fn has-val :: Vec _ Bool
+  => xs x
+  not (empty? (/? (y -> y == x) xs))
+
+;; Callbacks watching `id`, in registration (wid) order.
 fn watcher-fns-for :: Map Int Vec
   => ws id
   wids := sort (/? (w -> get "sig" (get w ws) == id) (keys ws))
   @ (w -> get "cb" (get w ws)) wids
+
+fn dep-kids :: Map Int Vec
+  => dependents id
+  if (contains? dependents id)
+    get id dependents
+  else
+    #[]
+
+;; BFS over reverse edges: mark every transitive dependent dirty once.
+;; Returns #(computes2 dirtied-ids).
+fn walk-dirty :: Map Map Vec Vec Tuple
+  => computes dependents queue dirtied
+  if (empty? queue)
+    #(computes dirtied)
+  else
+    step-dirty computes dependents queue dirtied
+
+fn step-dirty :: Map Map Vec Vec Tuple
+  => computes dependents queue dirtied
+  cid := head queue
+  rest := to-vec (tail queue)
+  if (has-val dirtied cid)
+    walk-dirty computes dependents rest dirtied
+  else
+    step-dirty-mark computes dependents rest dirtied cid
+
+fn step-dirty-mark :: Map Map Vec Vec Int Tuple
+  => computes dependents rest dirtied cid
+  c2 := assoc (get cid computes) "dirty" true
+  walk-dirty (assoc computes cid c2) dependents (concat rest (dep-kids dependents cid)) (conj dirtied cid)
+
+fn remove-cid :: Map Int Int Map
+  => deps-map cid dep
+  if (contains? deps-map dep)
+    assoc deps-map dep (to-vec (/? (x -> x /= cid) (get dep deps-map)))
+  else
+    deps-map
+
+fn add-cid :: Map Int Int Map
+  => deps-map cid dep
+  cur := dep-kids deps-map dep
+  if (has-val cur cid)
+    deps-map
+  else
+    assoc deps-map dep (conj cur cid)
+
+;; Point `cid`'s reverse edges at exactly `new-deps` (drop stale ones).
+fn retarget-deps :: Map Int Vec Vec Map
+  => deps-map cid old-deps new-deps
+  gone := /? (d -> not (has-val new-deps d)) old-deps
+  removed := fold (m d -> remove-cid m cid d) deps-map gone
+  fold (m d -> add-cid m cid d) removed new-deps
+
+;; Bundle entries for dirtied computes somebody watches:
+;; {cid= old= cbs=} — `old` is the pre-wave cached value.
+fn dirty-entries :: Map Map Vec Vec
+  => ws computes dirtied
+  watched := /? (cid -> not (empty? (watcher-fns-for ws cid))) dirtied
+  @ (cid -> {cid= cid old= (get "cached" (get cid computes)) cbs= (watcher-fns-for ws cid)}) watched
+
+;; Append id to the top tracking frame.
+fn track-dep :: Vec Int Vec
+  => tracking id
+  n := length tracking
+  top := last tracking
+  top2 := assoc top "deps" (conj (get "deps" top) id)
+  conj (to-vec (take (n - 1) tracking)) top2
+
+;; ── Handler ─────────────────────────────────────────
 
 pub handler reactive :: Reactive
   state :! fresh-graph ()
@@ -70,15 +165,36 @@ pub handler reactive :: Reactive
     state <- merge state {next-id= (id + 1) vals= vals2 vers= vers2}
     resume id
   rx-read id =>
-    resume (get id (get "vals" state))
+    tracking := get "tracking" state
+    if (empty? tracking)
+      ()
+    else
+      state <- assoc state "tracking" (track-dep tracking id)
+    cs := get "computes" state
+    if (contains? cs id)
+      resume (get "cached" (get id cs))
+    else
+      resume (get id (get "vals" state))
   rx-peek id =>
-    resume (get id (get "vals" state))
+    cs := get "computes" state
+    if (contains? cs id)
+      resume (get "cached" (get id cs))
+    else
+      resume (get id (get "vals" state))
   rx-poke id v =>
+    if (contains? (get "computes" state) id)
+      error "cannot write a compute"
+    else
+      ()
     old := get id (get "vals" state)
     vals2 := assoc (get "vals" state) id v
     vers2 := assoc (get "vers" state) id ((get id (get "vers" state)) + 1)
-    state <- merge state {vals= vals2 vers= vers2}
-    resume {old= old new= v watchers= (watcher-fns-for (get "watchers" state) id)}
+    walked := walk-dirty (get "computes" state) (get "dependents" state) (dep-kids (get "dependents" state) id) #[]
+    computes2 := nth 0 walked
+    dirtied := nth 1 walked
+    state <- merge state {vals= vals2 vers= vers2 computes= computes2}
+    ws := get "watchers" state
+    resume {old= old new= v watchers= (watcher-fns-for ws id) dirty-watched= (dirty-entries ws computes2 dirtied)}
   rx-version id =>
     resume (get id (get "vers" state))
   rx-watch id f =>
@@ -89,24 +205,111 @@ pub handler reactive :: Reactive
   rx-unwatch id wid =>
     state <- merge state {watchers= (dissoc (get "watchers" state) wid)}
     resume ()
+  rx-new-compute thunk =>
+    id := get "next-id" state
+    cs2 := assoc (get "computes" state) id {thunk= thunk dirty= true cached= () deps= #[]}
+    vers2 := assoc (get "vers" state) id 0
+    state <- merge state {next-id= (id + 1) computes= cs2 vers= vers2}
+    resume id
+  rx-meta id =>
+    cs := get "computes" state
+    if (contains? cs id)
+      resume (merge (get id cs) {compute= true})
+    else
+      resume {compute= false}
+  rx-begin-track id =>
+    state <- assoc state "tracking" (conj (get "tracking" state) {cid= id deps= #[]})
+    resume ()
+  rx-store id v =>
+    tracking := get "tracking" state
+    n := length tracking
+    frame := last tracking
+    new-deps := distinct (get "deps" frame)
+    c := get id (get "computes" state)
+    old-deps := get "deps" c
+    c2 := merge c {dirty= false cached= v deps= new-deps}
+    deps2 := retarget-deps (get "dependents" state) id old-deps new-deps
+    vers2 := assoc (get "vers" state) id ((get id (get "vers" state)) + 1)
+    state <- merge state {tracking= (to-vec (take (n - 1) tracking)) computes= (assoc (get "computes" state) id c2) dependents= deps2 vers= vers2}
+    resume ()
+  rx-abort-track () =>
+    tracking := get "tracking" state
+    n := length tracking
+    if (n == 0)
+      ()
+    else
+      state <- assoc state "tracking" (to-vec (take (n - 1) tracking))
+    resume ()
   rx-reset () =>
     state <- fresh-graph ()
     resume ()
 
-;; ── Dispatch (caller-side lambda invocation) ────────
+;; ── Dispatch + forcing (caller-side lambda invocation) ──
 
-;; The `::: eff` free row variable makes these effect-transparent
-;; (ambient frame): stored watcher lambdas run against the write
-;; site's effect row, which is exactly the contract we document.
+;; Free `::: eff` row = effect-transparent: stored lambdas run against
+;; the row of the site that triggers them (write / deref).
 fn run-watchers :: Vec _ _ () ::: eff
   => fns old new-v
   @ (f -> f old new-v) fns
   ()
 
-;; Invoke watcher callbacks from a poke bundle: each gets (old new).
-fn dispatch-bundle :: Map () ::: eff
+;; Run a compute thunk under a fresh tracking frame; store result.
+;; On thunk error: pop the frame, rethrow.
+fn recompute :: Int Fn _ ::: Reactive eff
+  => id thunk
+  rx-begin-track id
+  r := try (-> thunk ())
+  match r
+    Ok v =>
+      rx-store id v
+      v
+    Err msg =>
+      rethrow-after-abort msg
+
+fn rethrow-after-abort :: Str _ ::: Reactive
+  => msg
+  rx-abort-track ()
+  error msg
+
+fn drop-value :: _ ()
+  => v
+  ()
+
+fn freshen-compute :: Int Map () ::: Reactive eff
+  => id m
+  if (get "dirty" m)
+    drop-value (recompute id (get "thunk" m))
+  else
+    ()
+
+fn ensure-fresh :: Int Map () ::: Reactive eff
+  => id m
+  if (get "compute" m)
+    freshen-compute id m
+  else
+    ()
+
+;; Read any id: recompute first if it's a dirty compute, then rx-read
+;; (which also records the dep edge for an enclosing thunk).
+fn force-id :: Int _ ::: Reactive eff
+  => id
+  m := rx-meta id
+  ensure-fresh id m
+  rx-read id
+
+fn run-one-dirty :: Map () ::: Reactive eff
+  => e
+  new-v := force-id (get "cid" e)
+  run-watchers (get "cbs" e) (get "old" e) new-v
+
+;; Invoke watcher callbacks from a poke bundle: direct watchers first,
+;; then watched dirty computes (eagerly re-forced so watchers see the
+;; fresh value).
+fn dispatch-bundle :: Map () ::: Reactive eff
   => bundle
   run-watchers (get "watchers" bundle) (get "old" bundle) (get "new" bundle)
+  @ (e -> run-one-dirty e) (get "dirty-watched" bundle)
+  ()
 
 ;; ── Public API ──────────────────────────────────────
 
@@ -116,19 +319,29 @@ pub fn signal :: _ Sig ::: Reactive
   id := rx-new v
   Sig id
 
-;; Read a signal's current value. (From PR3 on, deref inside a compute
-;; also records the dependency; peek never will.)
-pub fn deref :: Sig _ ::: Reactive
-  => s
-  rx-read s.id
+;; Create a compute: a cached derived value. `thunk` runs on demand;
+;; every signal/compute it derefs becomes a dependency, re-recorded on
+;; every run. Lazy by default; watched computes re-run eagerly on
+;; upstream writes.
+pub fn compute :: (Fn):eff Sig ::: Reactive eff
+  => thunk
+  id := rx-new-compute thunk
+  Sig id
 
-;; Read without dependency tracking.
+;; Read a signal or compute. Dirty computes recompute first. Inside a
+;; running compute thunk this records the dependency edge.
+pub fn deref :: Sig _ ::: Reactive eff
+  => s
+  force-id s.id
+
+;; Read without tracking or forcing: signals give the current value,
+;; computes give the (possibly stale) cached value.
 pub fn peek :: Sig _ ::: Reactive
   => s
   rx-peek s.id
 
-;; Set a signal to a new value; watchers fire synchronously,
-;; in registration order. Returns the new value.
+;; Set a signal (writes to computes are rejected); watchers fire
+;; synchronously in registration order. Returns the new value.
 pub fn reset :: Sig _ _ ::: Reactive eff
   => s v
   bundle := rx-poke s.id v
@@ -142,7 +355,8 @@ pub fn swap :: Sig (Fn):eff _ ::: Reactive eff
   old := rx-peek s.id
   reset s (f old)
 
-;; Run f (old new) on every write to s. Returns a Watch handle.
+;; Run f (old new) on every write to s — works on signals and computes
+;; (watching a compute makes it eager). Returns a Watch handle.
 ;; Don't write the watched signal from its own watcher (sync cycle).
 pub fn watch :: Sig (Fn):eff Watch ::: Reactive eff
   => s f
@@ -154,7 +368,7 @@ pub fn unwatch :: Watch () ::: Reactive
   => w
   rx-unwatch w.sig w.wid
 
-;; Number of writes a signal has seen (0 for a fresh signal).
+;; Writes seen (signals) / recomputes done (computes).
 pub fn sig-version :: Sig Int ::: Reactive
   => s
   rx-version s.id
