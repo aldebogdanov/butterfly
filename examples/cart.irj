@@ -1,0 +1,78 @@
+;; Butterfly demo — a shopping cart as a reactive graph.
+;;
+;;   irij examples/cart.irj
+;;
+;; Shows: signals, auto-tracked computes (incl. a diamond), watchers,
+;; batching, snapshot/restore, and a debounced derived signal.
+
+use butterfly.core :open
+use butterfly.combinators :open
+
+fn banner ::: Console
+  => title
+  println ""
+  println ("── " ++ title ++ " ──")
+
+fn build-cart ::: Reactive Console
+  =>
+  price := signal 100
+  qty   := signal 2
+  rate  := signal 20
+
+  ;; diamond: subtotal and tax both read price/qty; total reads both
+  subtotal := compute (-> (deref price) * (deref qty))
+  tax      := compute (-> (deref subtotal) * (deref rate) / 100)
+  total    := compute (-> (deref subtotal) + (deref tax))
+
+  banner "initial"
+  println ("subtotal " ++ to-str (deref subtotal))
+  println ("tax      " ++ to-str (deref tax))
+  println ("total    " ++ to-str (deref total))
+
+  watch total (o n -> println ("total changed: " ++ to-str o ++ " → " ++ to-str n))
+
+  banner "one write, one recompute per node"
+  reset qty 3
+  println ("recomputes of total: " ++ to-str (sig-version total))
+
+  banner "batch: three writes, one notification"
+  batch (-> restock price qty rate)
+  println ("total    " ++ to-str (deref total))
+
+  banner "time travel"
+  snap := snapshot ()
+  reset price 999
+  println ("after write:   " ++ to-str (deref total))
+  restore snap
+  println ("after restore: " ++ to-str (deref total))
+
+fn restock ::: Reactive
+  => price qty rate
+  reset price 120
+  reset qty 10
+  reset rate 5
+
+fn watch-typing ::: Reactive Time Console
+  =>
+  banner "debounce: a burst collapses into one emission"
+  query    := signal ""
+  debounced := debounce 60 query
+  watch debounced (o n -> println ("search for: " ++ to-str n))
+  type-burst query
+  println "(only the last keystroke reached the search)"
+
+fn type-burst ::: Reactive Time
+  => query
+  reset query "i"
+  reset query "ir"
+  reset query "iri"
+  reset query "irij"
+  sleep 200
+
+fn main ::: Reactive Time Console
+  =>
+  with reactive
+    build-cart ()
+    watch-typing ()
+
+main ()
