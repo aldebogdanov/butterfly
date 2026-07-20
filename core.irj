@@ -2,6 +2,7 @@ mod butterfly.core
 
 use std.list {fold}
 use std.collection {distinct}
+use std.convert {to-int}
 
 ;; Butterfly — reactive signal graph for Irij.
 ;; Spindel-inspired: signals, computes, watchers over one effect-managed graph.
@@ -58,22 +59,29 @@ pub effect Reactive
   rx-begin-track :: Int ()
   rx-store       :: Int _ ()
   rx-abort-track :: ()
+  rx-enter-batch :: ()
+  rx-exit-batch  :: Map
   rx-reset       :: ()
 
 ;; ── Graph state ─────────────────────────────────────
 
-;; next-id:    fresh Sig ids (signals and computes share the id space)
-;; vals:       signal id → current value
-;; vers:       id → write counter (for signals) / recompute counter
-;;             (for computes); listen polls this (PR5)
-;; watchers:   wid → {sig= cb=} — flat registry, filtered per write
-;; next-wid:   fresh watcher ids
-;; computes:   id → {thunk= dirty= cached= deps=}
-;; dependents: id → Vec of compute ids that read it (reverse edges)
-;; tracking:   stack of {cid= deps=} frames, one per running thunk
+;; next-id:       fresh Sig ids (signals and computes share the id space)
+;; vals:          signal id → current value
+;; vers:          id → write counter (for signals) / recompute counter
+;;                (for computes); listen polls this (PR5)
+;; watchers:      wid → {sig= cb=} — flat registry, filtered per write
+;; next-wid:      fresh watcher ids
+;; computes:      id → {thunk= dirty= cached= deps=}
+;; dependents:    id → Vec of compute ids that read it (reverse edges)
+;; tracking:      stack of {cid= deps=} frames, one per running thunk
+;; batch-depth:   nesting level of open batches
+;; pending:       id → {old= new=} accumulated during a batch
+;;                (first old, last new)
+;; pending-dirty: cid → pre-batch cached value, captured at first
+;;                dirtying inside the batch
 fn fresh-graph :: Map
   =>
-  {next-id= 0 vals= {} vers= {} watchers= {} next-wid= 0 computes= {} dependents= {} tracking= #[]}
+  {next-id= 0 vals= {} vers= {} watchers= {} next-wid= 0 computes= {} dependents= {} tracking= #[] batch-depth= 0 pending= {} pending-dirty= {}}
 
 ;; ── Pure graph helpers (called from clauses — must stay pure) ──
 
@@ -81,10 +89,11 @@ fn has-val :: Vec _ Bool
   => xs x
   not (empty? (/? (y -> y == x) xs))
 
-;; Callbacks watching `id`, in registration (wid) order.
+;; Callbacks watching `id`, in registration (wid) order. NB: `keys`
+;; returns Str keys — convert before sorting or "10" sorts before "2".
 fn watcher-fns-for :: Map Int Vec
   => ws id
-  wids := sort (/? (w -> get "sig" (get w ws) == id) (keys ws))
+  wids := sort (@ (k -> to-int k) (/? (w -> get "sig" (get w ws) == id) (keys ws)))
   @ (w -> get "cb" (get w ws)) wids
 
 fn dep-kids :: Map Int Vec
@@ -154,6 +163,79 @@ fn track-dep :: Vec Int Vec
   top2 := assoc top "deps" (conj (get "deps" top) id)
   conj (to-vec (take (n - 1) tracking)) top2
 
+;; ── Pure write/batch steps (bundle shape: {entries= dirty-watched=}) ──
+
+fn empty-bundle :: Map
+  =>
+  {entries= #[] dirty-watched= #[]}
+
+;; Merge a write into pending: keep the first old, take the last new.
+fn merge-pending :: Map Int _ _ Map
+  => pending id old v
+  if (contains? pending id)
+    assoc pending id {old= (get "old" (get id pending)) new= v}
+  else
+    assoc pending id {old= old new= v}
+
+;; Capture a compute's pre-batch cached value at first dirtying.
+fn remember-dirty-old :: Map Map Int Map
+  => pd computes cid
+  if (contains? pd cid)
+    pd
+  else
+    assoc pd cid (get "cached" (get cid computes))
+
+;; One write. Returns #(state2 bundle) — bundle is empty while a
+;; batch is open (notifications deferred into pending/pending-dirty).
+fn poke-step :: Map Int _ Tuple
+  => st id v
+  old := get id (get "vals" st)
+  vals2 := assoc (get "vals" st) id v
+  vers2 := assoc (get "vers" st) id ((get id (get "vers" st)) + 1)
+  walked := walk-dirty (get "computes" st) (get "dependents" st) (dep-kids (get "dependents" st) id) #[]
+  st2 := merge st {vals= vals2 vers= vers2 computes= (nth 0 walked)}
+  if ((get "batch-depth" st) > 0)
+    poke-defer st2 id old v (nth 1 walked)
+  else
+    poke-immediate st2 id old v (nth 1 walked)
+
+fn poke-immediate :: Map Int _ _ Vec Tuple
+  => st id old v dirtied
+  ws := get "watchers" st
+  entry := {cbs= (watcher-fns-for ws id) old= old new= v}
+  #(st {entries= #[entry] dirty-watched= (dirty-entries ws (get "computes" st) dirtied)})
+
+fn poke-defer :: Map Int _ _ Vec Tuple
+  => st id old v dirtied
+  p2 := merge-pending (get "pending" st) id old v
+  pd2 := fold (m cid -> remember-dirty-old m (get "computes" st) cid) (get "pending-dirty" st) dirtied
+  #((merge st {pending= p2 pending-dirty= pd2}) (empty-bundle ()))
+
+fn pending-entry :: Map Map Int Map
+  => ws pending id
+  p := get id pending
+  {cbs= (watcher-fns-for ws id) old= (get "old" p) new= (get "new" p)}
+
+;; Outermost batch exit: turn pending/pending-dirty into one bundle.
+fn flush-batch :: Map Tuple
+  => st
+  ws := get "watchers" st
+  pending := get "pending" st
+  entries := @ (id -> pending-entry ws pending id) (sort (@ (k -> to-int k) (keys pending)))
+  pd := get "pending-dirty" st
+  watched := /? (cid -> not (empty? (watcher-fns-for ws cid))) (sort (@ (k -> to-int k) (keys pd)))
+  dw := @ (cid -> {cid= cid old= (get cid pd) cbs= (watcher-fns-for ws cid)}) watched
+  #((merge st {pending= {} pending-dirty= {}}) {entries= entries dirty-watched= dw})
+
+;; Close one batch level. Returns #(state2 bundle).
+fn exit-batch-step :: Map Tuple
+  => st
+  d2 := (get "batch-depth" st) - 1
+  if (d2 > 0)
+    #((assoc st "batch-depth" d2) (empty-bundle ()))
+  else
+    flush-batch (assoc st "batch-depth" 0)
+
 ;; ── Handler ─────────────────────────────────────────
 
 pub handler reactive :: Reactive
@@ -186,15 +268,9 @@ pub handler reactive :: Reactive
       error "cannot write a compute"
     else
       ()
-    old := get id (get "vals" state)
-    vals2 := assoc (get "vals" state) id v
-    vers2 := assoc (get "vers" state) id ((get id (get "vers" state)) + 1)
-    walked := walk-dirty (get "computes" state) (get "dependents" state) (dep-kids (get "dependents" state) id) #[]
-    computes2 := nth 0 walked
-    dirtied := nth 1 walked
-    state <- merge state {vals= vals2 vers= vers2 computes= computes2}
-    ws := get "watchers" state
-    resume {old= old new= v watchers= (watcher-fns-for ws id) dirty-watched= (dirty-entries ws computes2 dirtied)}
+    stepped := poke-step state id v
+    state <- nth 0 stepped
+    resume (nth 1 stepped)
   rx-version id =>
     resume (get id (get "vers" state))
   rx-watch id f =>
@@ -240,6 +316,13 @@ pub handler reactive :: Reactive
     else
       state <- assoc state "tracking" (to-vec (take (n - 1) tracking))
     resume ()
+  rx-enter-batch () =>
+    state <- assoc state "batch-depth" ((get "batch-depth" state) + 1)
+    resume ()
+  rx-exit-batch () =>
+    stepped := exit-batch-step state
+    state <- nth 0 stepped
+    resume (nth 1 stepped)
   rx-reset () =>
     state <- fresh-graph ()
     resume ()
@@ -302,14 +385,20 @@ fn run-one-dirty :: Map () ::: Reactive eff
   new-v := force-id (get "cid" e)
   run-watchers (get "cbs" e) (get "old" e) new-v
 
-;; Invoke watcher callbacks from a poke bundle: direct watchers first,
-;; then watched dirty computes (eagerly re-forced so watchers see the
-;; fresh value).
+;; Invoke watcher callbacks from a bundle: per-signal entries first
+;; (id order for batches), then watched dirty computes (eagerly
+;; re-forced so watchers see the fresh value).
 fn dispatch-bundle :: Map () ::: Reactive eff
   => bundle
-  run-watchers (get "watchers" bundle) (get "old" bundle) (get "new" bundle)
+  @ (e -> run-watchers (get "cbs" e) (get "old" e) (get "new" e)) (get "entries" bundle)
   @ (e -> run-one-dirty e) (get "dirty-watched" bundle)
   ()
+
+fn unwrap-result :: _ _
+  => r
+  match r
+    Ok v => v
+    Err msg => error msg
 
 ;; ── Public API ──────────────────────────────────────
 
@@ -367,6 +456,20 @@ pub fn watch :: Sig (Fn):eff Watch ::: Reactive eff
 pub fn unwatch :: Watch () ::: Reactive
   => w
   rx-unwatch w.sig w.wid
+
+;; Run thunk with notifications deferred: N writes collapse into one
+;; wave at the outermost batch exit (per signal: first old, last new;
+;; watched computes fire once with their pre-batch old). Reads inside
+;; the batch see fresh values. If thunk throws, writes made before
+;; the error still notify (state is already committed), then the
+;; error propagates. Returns thunk's value.
+pub fn batch :: (Fn):eff _ ::: Reactive eff
+  => thunk
+  rx-enter-batch ()
+  r := try (-> thunk ())
+  bundle := rx-exit-batch ()
+  dispatch-bundle bundle
+  unwrap-result r
 
 ;; Writes seen (signals) / recomputes done (computes).
 pub fn sig-version :: Sig Int ::: Reactive

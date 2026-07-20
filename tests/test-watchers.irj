@@ -79,6 +79,31 @@ fn run-console-watcher ::: Reactive Console
     reset src 8
     assert-eq 8 (deref src)
 
+;; Locals are captured by value, so each registered lambda keeps its
+;; own i. 12 watchers crosses the wid=10 boundary — guards against
+;; lexicographic ordering of stringified registry keys.
+fn add-watchers-upto ::: Reactive eff
+  => src log i limit
+  if (i == limit)
+    ()
+  else
+    add-watchers-step src log i limit
+
+fn add-watchers-step ::: Reactive eff
+  => src log i limit
+  watch src (o n -> swap log (xs -> conj xs i))
+  add-watchers-upto src log (i + 1) limit
+
+fn run-twelve-watcher-order ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    src := signal 0
+    log := signal #[]
+    add-watchers-upto src log 0 12
+    reset src 1
+    assert-eq #[0 1 2 3 4 5 6 7 8 9 10 11] (deref log)
+
 fn run-unwatch-idempotent ::: Reactive
   =>
   with reactive
@@ -98,6 +123,7 @@ results := #[
   (test "watchers are scoped to their signal"        run-signal-scoped)
   (test "watcher cascade propagates writes"          run-cascade)
   (test "console-effect watcher runs at write site"  run-console-watcher)
+  (test "12 watchers fire in wid order (10+ boundary)" run-twelve-watcher-order)
   (test "double unwatch is harmless"                 run-unwatch-idempotent)
 ]
 
