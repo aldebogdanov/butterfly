@@ -1,0 +1,165 @@
+use std.test :open
+use butterfly.core :open
+
+;; Branch helper: lambda bodies are single expressions, so branching
+;; thunk logic lives in top-level fns.
+fn choose ::: Reactive eff
+  => flag x y
+  if (deref flag)
+    deref x
+  else
+    deref y
+
+fn run-basic ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 3
+    b := compute (-> (deref a) * 2)
+    assert-eq 6 (deref b)
+    reset a 10
+    assert-eq 20 (deref b)
+
+fn run-cached ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    b := compute (-> (deref a) + 1)
+    deref b
+    v1 := sig-version b
+    deref b
+    deref b
+    assert-eq v1 (sig-version b)
+
+fn run-chain ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    b := compute (-> (deref a) + 1)
+    c := compute (-> (deref b) * 10)
+    assert-eq 20 (deref c)
+    reset a 4
+    assert-eq 50 (deref c)
+
+fn run-diamond ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    b := compute (-> (deref a) * 2)
+    c := compute (-> (deref a) + 100)
+    d := compute (-> (deref b) + (deref c))
+    assert-eq 103 (deref d)
+    assert-eq 1 (sig-version d)
+    reset a 5
+    assert-eq 115 (deref d)
+    assert-eq 2 (sig-version d)
+    assert-eq 2 (sig-version b)
+    assert-eq 2 (sig-version c)
+
+fn run-retrack ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    flag := signal true
+    x := signal 10
+    y := signal 20
+    k := compute (-> choose flag x y)
+    assert-eq 10 (deref k)
+    reset flag false
+    assert-eq 20 (deref k)
+    kv := sig-version k
+    reset x 999
+    assert-eq kv (sig-version k)
+    assert-eq 20 (deref k)
+    assert-eq kv (sig-version k)
+    reset y 777
+    assert-eq 777 (deref k)
+
+fn run-watched-eager ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    c := compute (-> (deref a) + 100)
+    deref c
+    seen := signal #()
+    watch c (o n -> reset seen #(o n))
+    reset a 10
+    assert-eq #(101 110) (deref seen)
+
+fn run-unwatched-lazy ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    c := compute (-> (deref a) + 100)
+    deref c
+    cv := sig-version c
+    reset a 10
+    assert-eq cv (sig-version c)
+    assert-eq 110 (deref c)
+
+fn run-peek-stale ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    c := compute (-> (deref a) + 100)
+    deref c
+    reset a 50
+    assert-eq 101 (peek c)
+    cv := sig-version c
+    assert-eq cv (sig-version c)
+    assert-eq 150 (deref c)
+
+fn run-constant ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    k := compute (-> 42)
+    assert-eq 42 (deref k)
+    assert-eq 42 (deref k)
+    assert-eq 1 (sig-version k)
+
+fn run-unwatch-compute ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    c := compute (-> (deref a) + 1)
+    deref c
+    seen := signal 0
+    w := watch c (o n -> reset seen n)
+    unwatch w
+    reset a 5
+    assert-eq 0 (deref seen)
+
+fn attempt-compute-write ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    b := compute (-> 1)
+    reset b 42
+
+fn run-write-guard ::: Reactive
+  =>
+  assert-throws (-> attempt-compute-write ())
+
+results := #[
+  (test "compute derives and updates"                     run-basic)
+  (test "clean compute reuses cache (no recompute)"       run-cached)
+  (test "compute chains propagate"                        run-chain)
+  (test "diamond recomputes each node exactly once"       run-diamond)
+  (test "branch switch re-tracks deps (old dep unlinked)" run-retrack)
+  (test "watched compute re-forces eagerly with old/new"  run-watched-eager)
+  (test "unwatched compute stays lazy until deref"        run-unwatched-lazy)
+  (test "peek returns stale cache without forcing"        run-peek-stale)
+  (test "constant compute runs once"                      run-constant)
+  (test "unwatch on compute stops delivery"               run-unwatch-compute)
+  (test "writing a compute is rejected"                   run-write-guard)
+]
+
+summarize results
