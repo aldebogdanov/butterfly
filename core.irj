@@ -62,6 +62,8 @@ pub effect Reactive
   rx-abort-track :: ()
   rx-enter-batch :: ()
   rx-exit-batch  :: Map
+  rx-snapshot    :: Map
+  rx-restore     :: Map ()
   rx-reset       :: ()
 
 ;; ── Graph state ─────────────────────────────────────
@@ -324,6 +326,11 @@ pub handler reactive :: Reactive
     stepped := exit-batch-step state
     state <- nth 0 stepped
     resume (nth 1 stepped)
+  rx-snapshot () =>
+    resume state
+  rx-restore snap =>
+    state <- snap
+    resume ()
   rx-reset () =>
     state <- fresh-graph ()
     resume ()
@@ -518,3 +525,18 @@ pub fn listen-or :: Int Sig _ _ ::: Reactive Time
 pub fn reset-graph :: () ::: Reactive
   =>
   rx-reset ()
+
+;; ── Time travel ─────────────────────────────────────
+
+;; The whole graph as a value (persistent map — structural sharing,
+;; O(1)). In-memory only: it contains watcher/compute lambdas.
+pub fn snapshot :: Map ::: Reactive
+  =>
+  rx-snapshot ()
+
+;; Rewind to a snapshot. Silent: no watchers fire on the swap itself.
+;; Handles created after the snapshot dangle — their ids are reused
+;; by signals created after the restore. Don't restore mid-batch.
+pub fn restore :: Map () ::: Reactive
+  => snap
+  rx-restore snap
