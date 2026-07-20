@@ -476,6 +476,38 @@ pub fn sig-version :: Sig Int ::: Reactive
   => s
   rx-version s.id
 
+;; ── Blocking reads (sleep-poll transport, v0.1) ─────
+
+;; Block until s's next write (signals) / recompute (computes) after
+;; this call; return the fresh value. 5 ms poll cadence. This is the
+;; one blessed cross-fiber read path in v0.1: spawn the listener
+;; inside the same `with reactive` so it inherits the handler.
+pub fn listen :: Sig _ ::: Reactive Time
+  => s
+  v0 := rx-version s.id
+  poll-change s.id v0
+
+fn poll-change :: Int Int _ ::: Reactive Time
+  => id v0
+  v1 := rx-version id
+  if (v1 /= v0)
+    rx-peek id
+  else
+    poll-wait id v0
+
+fn poll-wait :: Int Int _ ::: Reactive Time
+  => id v0
+  sleep 5
+  poll-change id v0
+
+;; listen, but give up after ms and return fallback instead.
+pub fn listen-or :: Int Sig _ _ ::: Reactive Time
+  => ms s fallback
+  r := try (-> timeout ms (-> listen s))
+  match r
+    Ok v => v
+    Err _ => fallback
+
 ;; Drop the whole graph. Test isolation: handler state is a global
 ;; singleton, so every test case starts with reset-graph.
 pub fn reset-graph :: () ::: Reactive

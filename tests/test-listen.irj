@@ -1,0 +1,94 @@
+use std.test :open
+use butterfly.core :open
+
+;; Concurrency notes:
+;; - `spawn` is fire-and-forget (returns a raw thread `await` can't
+;;   take) — the composable pairs are `par` and `scope`/fork.
+;; - Fibers inherit the parent's handler stack, so forks made inside
+;;   `with reactive` reach the same graph.
+
+fn listen-and-store ::: Reactive Time eff
+  => s result
+  v := listen s
+  reset result v
+
+;; par combiner keeps the listener's value: run listener + writer in
+;; parallel, return what the listener saw.
+fn write-42-later ::: Reactive Time eff
+  => s
+  sleep 30
+  reset s 42
+
+fn cross-fiber-value ::: Reactive Time eff
+  => s
+  par (a b -> a) (-> listen s) (-> write-42-later s)
+
+fn run-cross-fiber ::: Reactive Time
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    v := cross-fiber-value s
+    assert-eq 42 v
+
+fn listen-twice ::: Reactive Time eff
+  => s out1 out2
+  v1 := listen s
+  reset out1 v1
+  v2 := listen s
+  reset out2 v2
+
+;; scope auto-joins children at block exit — loop-subscriber pattern.
+fn loop-scenario ::: Reactive Time eff
+  => s out1 out2
+  scope sc
+    sc.fork (-> listen-twice s out1 out2)
+    sleep 30
+    swap s (x -> x + 1)
+    sleep 30
+    swap s (x -> x + 1)
+
+fn run-loop-pattern ::: Reactive Time
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    o1 := signal 0
+    o2 := signal 0
+    loop-scenario s o1 o2
+    assert-eq 1 (deref o1)
+    assert-eq 2 (deref o2)
+
+fn run-listen-or-timeout ::: Reactive Time
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    v := listen-or 40 s :gave-up
+    assert-eq :gave-up v
+
+fn write-7-later ::: Reactive Time eff
+  => s
+  sleep 30
+  reset s 7
+
+fn listen-or-race ::: Reactive Time eff
+  => s
+  par (a b -> a) (-> listen-or 500 s 999) (-> write-7-later s)
+
+fn run-listen-or-value ::: Reactive Time
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    v := listen-or-race s
+    assert-eq 7 v
+
+results := #[
+  (test "par: listener fiber sees a cross-fiber reset"   run-cross-fiber)
+  (test "scope: sequential listens = loop subscriber"    run-loop-pattern)
+  (test "listen-or falls back after the deadline"        run-listen-or-timeout)
+  (test "listen-or returns the value when it arrives"    run-listen-or-value)
+]
+
+summarize results
