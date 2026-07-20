@@ -1,0 +1,91 @@
+use std.test :open
+use butterfly.core :open
+
+fn run-time-travel ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 1
+    snap := snapshot ()
+    reset s 99
+    restore snap
+    assert-eq 1 (deref s)
+
+fn run-id-reuse ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 1
+    snap := snapshot ()
+    t := signal 5
+    restore snap
+    u := signal 7
+    assert-eq t.id u.id
+    assert-eq 7 (deref u)
+    assert-eq 1 (deref s)
+
+fn run-computes-restore ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    a := signal 1
+    c := compute (-> (deref a) + 100)
+    deref c
+    snap := snapshot ()
+    reset a 50
+    assert-eq 150 (deref c)
+    restore snap
+    assert-eq 101 (deref c)
+    reset a 10
+    assert-eq 110 (deref c)
+
+fn run-watchers-survive ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    seen := signal 0
+    watch s (o n -> reset seen n)
+    snap := snapshot ()
+    restore snap
+    reset s 42
+    assert-eq 42 (deref seen)
+
+fn run-restore-is-silent ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 0
+    hits := signal 0
+    watch s (o n -> swap hits (x -> x + 1))
+    snap := snapshot ()
+    reset s 5
+    peeked := peek hits
+    restore snap
+    assert-eq 1 peeked
+    assert-eq 0 (deref hits)
+
+fn run-two-snapshots ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    s := signal 1
+    snap1 := snapshot ()
+    reset s 2
+    snap2 := snapshot ()
+    reset s 3
+    restore snap1
+    assert-eq 1 (deref s)
+    restore snap2
+    assert-eq 2 (deref s)
+
+results := #[
+  (test "snapshot + restore rewinds signal values"        run-time-travel)
+  (test "post-snapshot handles dangle; ids are reused"    run-id-reuse)
+  (test "computes rewind and stay live after restore"     run-computes-restore)
+  (test "pre-snapshot watchers still fire after restore"  run-watchers-survive)
+  (test "restore itself fires no watchers"                run-restore-is-silent)
+  (test "multiple snapshots restore independently"        run-two-snapshots)
+]
+
+summarize results
