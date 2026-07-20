@@ -1,7 +1,7 @@
 use std.test :open
 use butterfly.core :open
 
-fn write-three ::: Reactive eff
+fn write-three ::: Reactive
   => s
   swap s (x -> x + 1)
   swap s (x -> x + 1)
@@ -18,7 +18,7 @@ fn run-collapse ::: Reactive
     assert-eq #[#(0 3)] (deref log)
     assert-eq 3 (deref s)
 
-fn write-two-signals ::: Reactive eff
+fn write-two-signals ::: Reactive
   => a b
   reset a 1
   reset b 2
@@ -36,7 +36,7 @@ fn run-multi-signal ::: Reactive
     batch (-> write-two-signals a b)
     assert-eq #[#("a" 0 10) #("b" 0 2)] (deref log)
 
-fn inner-writes ::: Reactive eff
+fn inner-writes ::: Reactive
   => s
   batch (-> write-three s)
   swap s (x -> x + 100)
@@ -70,7 +70,7 @@ fn run-read-your-writes ::: Reactive
     batch (-> observe-mid-batch a c probe)
     assert-eq 70 (deref probe)
 
-fn observe-mid-batch ::: Reactive eff
+fn observe-mid-batch ::: Reactive
   => a c probe
   reset a 7
   reset probe (deref c)
@@ -97,7 +97,7 @@ fn run-empty-batch ::: Reactive
     batch (-> ())
     assert-eq 0 (deref hits)
 
-fn failing-writes ::: Reactive eff
+fn failing-writes ::: Reactive
   => s
   reset s 1
   error "boom inside batch"
