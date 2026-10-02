@@ -361,7 +361,7 @@ fn recompute :: Int (Fn):eff _ ::: Reactive eff
     Err msg =>
       rethrow-after-abort msg
 
-fn rethrow-after-abort :: Str _ ::: Reactive
+fn rethrow-after-abort :: _ _ ::: Reactive
   => msg
   rx-abort-track ()
   error msg

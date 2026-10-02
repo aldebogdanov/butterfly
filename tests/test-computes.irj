@@ -148,6 +148,25 @@ fn run-write-guard ::: Reactive
   =>
   assert-throws (-> attempt-compute-write ())
 
+;; A compute whose thunk raises a value: deref re-raises that value, so a
+;; caller can match on it (Irij 0.9.237 keeps raised values through try).
+fn failing-compute ::: Reactive
+  =>
+  with reactive
+    reset-graph ()
+    c := compute (-> error {code= :stale-source})
+    deref c
+
+fn caught-code ::: Reactive
+  =>
+  match (try (-> failing-compute ()))
+    Err e => e.code
+    Ok _ => :none
+
+fn run-raised-value ::: Reactive
+  =>
+  assert-eq :stale-source (caught-code ())
+
 results := #[
   (test "compute derives and updates"                     run-basic)
   (test "clean compute reuses cache (no recompute)"       run-cached)
@@ -160,6 +179,7 @@ results := #[
   (test "constant compute runs once"                      run-constant)
   (test "unwatch on compute stops delivery"               run-unwatch-compute)
   (test "writing a compute is rejected"                   run-write-guard)
+  (test "a compute's raised value reaches the caller"     run-raised-value)
 ]
 
 summarize results
