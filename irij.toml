@@ -5,3 +5,11 @@ description = "Irij reactivity library"
 author = "aldebogdanov"
 repo = "https://github.com/aldebogdanov/butterfly"
 license = "MIT"
+
+# Who may reach Java: modules that bind a Java class with `cap` (caps),
+# write Java by hand (jvm), seeds that bring Java libraries (jars).
+# Written by `irij audit --fix` — review it.
+[trust]
+caps = []
+jvm = []
+jars = []
